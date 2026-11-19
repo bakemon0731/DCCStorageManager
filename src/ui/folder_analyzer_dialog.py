@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
 )
 
 from core.dcc_classifier import ClassificationResult, classify_path
+from core.settings_store import SettingsError, SettingsStore, CustomLocation
+from ui.custom_location_dialog import CustomLocationDialog
 from core.folder_scanner import (
     FolderScanResult,
     ScanProgress,
@@ -79,6 +81,14 @@ class FolderAnalyzerDialog(QDialog):
 
         self._worker: FolderScanWorker | None = None
         self._close_requested = False
+        self._settings_store = SettingsStore()
+        self._custom_locations: tuple[CustomLocation, ...] = ()
+        self._settings_load_error: str | None = None
+        try:
+            self._custom_locations = self._settings_store.load().custom_locations
+        except SettingsError as exc:
+            # Do not overwrite a damaged settings file with empty defaults.
+            self._settings_load_error = str(exc)
 
         self._build_ui()
         self._apply_style()
@@ -121,17 +131,26 @@ class FolderAnalyzerDialog(QDialog):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_scan)
 
+        self.custom_locations_button = QPushButton("保存先ルール...")
+        self.custom_locations_button.clicked.connect(self.manage_custom_locations)
+
         self.close_button = QPushButton("閉じる")
         self.close_button.clicked.connect(self.close)
 
         action_row.addWidget(self.start_button)
         action_row.addWidget(self.cancel_button)
+        action_row.addWidget(self.custom_locations_button)
         action_row.addStretch(1)
         action_row.addWidget(self.close_button)
         root_layout.addLayout(action_row)
 
-        self.status_label = QLabel("調査するフォルダを選択してください。")
+        initial_status = "調査するフォルダを選択してください。"
+        if self._settings_load_error:
+            initial_status = "設定を読み込めません。保存先ルールを確認してください。"
+        self.status_label = QLabel(initial_status)
         self.status_label.setObjectName("statusLabel")
+        if self._settings_load_error:
+            self.status_label.setToolTip(self._settings_load_error)
         root_layout.addWidget(self.status_label)
 
         self.progress_bar = QProgressBar()
@@ -230,6 +249,7 @@ class FolderAnalyzerDialog(QDialog):
         self.start_button.setEnabled(False)
         self.browse_button.setEnabled(False)
         self.folder_path_edit.setEnabled(False)
+        self.custom_locations_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate: total file count is unknown.
         self.status_label.setText("フォルダを調査しています...")
@@ -243,6 +263,21 @@ class FolderAnalyzerDialog(QDialog):
         worker.finished.connect(worker.deleteLater)
         self._worker = worker
         worker.start()
+
+    def manage_custom_locations(self) -> None:
+        """Open settings UI and refresh the active custom rules after editing."""
+        if self._worker is not None and self._worker.isRunning():
+            return
+
+        dialog = CustomLocationDialog(self._settings_store, self)
+        dialog.exec()
+        try:
+            self._custom_locations = self._settings_store.load().custom_locations
+            self._settings_load_error = None
+            self.status_label.setToolTip("")
+        except SettingsError as exc:
+            self._settings_load_error = str(exc)
+            QMessageBox.warning(self, "設定を読み込めません", str(exc))
 
     def cancel_scan(self) -> None:
         if self._worker is None or not self._worker.isRunning():
@@ -295,7 +330,7 @@ class FolderAnalyzerDialog(QDialog):
     def _populate_directory_table(self, result: FolderScanResult) -> None:
         self.directory_table.setRowCount(len(result.largest_directories))
         for row, entry in enumerate(result.largest_directories):
-            classification = classify_path(entry.path)
+            classification = classify_path(entry.path, self._custom_locations)
             tooltip = self._classification_tooltip(classification)
 
             name = Path(entry.path).name or entry.path
@@ -321,7 +356,7 @@ class FolderAnalyzerDialog(QDialog):
         root = Path(result.root_path)
         self.file_table.setRowCount(len(result.largest_files))
         for row, entry in enumerate(result.largest_files):
-            classification = classify_path(entry.path)
+            classification = classify_path(entry.path, self._custom_locations)
             tooltip = self._classification_tooltip(classification)
 
             try:
@@ -356,6 +391,7 @@ class FolderAnalyzerDialog(QDialog):
         self.start_button.setEnabled(True)
         self.browse_button.setEnabled(True)
         self.folder_path_edit.setEnabled(True)
+        self.custom_locations_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)

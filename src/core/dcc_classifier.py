@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import os
 import re
+import ntpath
+import posixpath
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import TypeAlias
+from typing import Iterable, TypeAlias
+
+from core.settings_store import CustomLocation
 
 PathLike: TypeAlias = str | os.PathLike[str]
 
@@ -21,6 +25,7 @@ class DataCategory(str, Enum):
 
     CACHE_CANDIDATE = "キャッシュ候補"
     BACKUP = "バックアップ候補"
+    MIXED = "複数分類（要確認）"
     UNKNOWN = "不明"
 
 
@@ -157,6 +162,11 @@ _CATEGORY_SAFETY_NOTES = {
         "復元に必要なデータの可能性があります。最新世代や復元要否を確認してください。"
         "自動削除は行いません。"
     ),
+    DataCategory.MIXED: (
+        "このフォルダ配下に異なる種類の登録先が含まれています。親フォルダ全体を"
+        "キャッシュまたはバックアップとして扱わず、個別のフォルダを確認してください。"
+        "自動削除は行いません。"
+    ),
     DataCategory.UNKNOWN: (
         "名前だけでは分類できません。プロジェクトデータの可能性があるため、削除候補にしません。"
     ),
@@ -227,12 +237,109 @@ def _matches_rule(
     return has_path_match or has_prefix_match or has_suffix_match
 
 
-def classify_path(path: PathLike) -> ClassificationResult:
+
+def _is_windows_style_path(raw_path: str) -> bool:
+    return "\\\\" in raw_path or (len(raw_path) >= 2 and raw_path[1] == ":")
+
+
+def _is_same_or_descendant_path(candidate: str, registered_root: str) -> bool:
+    """Compare paths by components, not string prefixes.
+
+    This is a lexical comparison: it does not resolve symlinks or require an
+    external drive to be connected. Windows paths are case-insensitive.
+    """
+    candidate_windows = _is_windows_style_path(candidate)
+    root_windows = _is_windows_style_path(registered_root)
+    if candidate_windows != root_windows:
+        return False
+
+    if candidate_windows:
+        candidate_normalized = ntpath.normpath(candidate.replace("/", "\\"))
+        root_normalized = ntpath.normpath(registered_root.replace("/", "\\"))
+        candidate_parts = tuple(
+            part.casefold() for part in PureWindowsPath(candidate_normalized).parts
+        )
+        root_parts = tuple(
+            part.casefold() for part in PureWindowsPath(root_normalized).parts
+        )
+    else:
+        candidate_parts = PurePosixPath(posixpath.normpath(candidate)).parts
+        root_parts = PurePosixPath(posixpath.normpath(registered_root)).parts
+
+    return (
+        len(candidate_parts) >= len(root_parts)
+        and candidate_parts[: len(root_parts)] == root_parts
+    )
+
+
+def _find_custom_location(
+    raw_path: str, custom_locations: Iterable[CustomLocation]
+) -> CustomLocation | None:
+    """Return the most specific registered location matching this path."""
+    matches = [
+        location
+        for location in custom_locations
+        if _is_same_or_descendant_path(raw_path, location.path)
+    ]
+    if not matches:
+        return None
+
+    # A nested registration is more specific than its parent registration.
+    def path_depth(location: CustomLocation) -> int:
+        if _is_windows_style_path(location.path):
+            return len(PureWindowsPath(location.path).parts)
+        return len(PurePosixPath(location.path).parts)
+
+    # Prefer the deepest registration. If malformed/external settings ever
+    # contain same-depth overlapping matches, prefer backup conservatively.
+    return max(
+        matches,
+        key=lambda location: (
+            path_depth(location),
+            1 if location.category == "backup" else 0,
+        ),
+    )
+
+
+def _find_conflicting_descendant_locations(
+    raw_path: str,
+    parent_location: CustomLocation,
+    custom_locations: Iterable[CustomLocation],
+) -> tuple[CustomLocation, ...]:
+    """Find nested registrations that make a registered parent mixed.
+
+    Example: E:\\test is registered as cache while
+    E:\\test\\Backup is registered as backup. The exact parent folder
+    contains both categories, so it must not be presented as pure cache.
+    """
+    conflicts: list[CustomLocation] = []
+    for location in custom_locations:
+        if location.id == parent_location.id:
+            continue
+        if (
+            location.category == parent_location.category
+            and location.application == parent_location.application
+        ):
+            continue
+
+        # The registered path must be strictly below the candidate path.
+        is_descendant = _is_same_or_descendant_path(location.path, raw_path)
+        is_same_or_ancestor = _is_same_or_descendant_path(raw_path, location.path)
+        if is_descendant and not is_same_or_ancestor:
+            conflicts.append(location)
+
+    return tuple(conflicts)
+
+
+def classify_path(
+    path: PathLike, custom_locations: Iterable[CustomLocation] = ()
+) -> ClassificationResult:
     """Classify a path using conservative names and path signatures.
 
     The function does not inspect file contents, access the filesystem, or
-    infer that an item is safe to delete. Custom cache locations whose names do
-    not contain recognizable markers will be returned as UNKNOWN.
+    infer that an item is safe to delete. Explicit user-registered locations
+    can classify arbitrary paths. Built-in backup markers override a custom
+    cache registration to protect likely recovery data.
     """
     try:
         raw_path_value = os.fspath(path)
@@ -242,6 +349,9 @@ def classify_path(path: PathLike) -> ClassificationResult:
         raise ValueError("path must be a non-empty string or Path")
 
     raw_path = raw_path_value.strip()
+    # Materialize once because custom locations are consulted more than once
+    # (the caller may have supplied a one-shot generator).
+    custom_location_list = tuple(custom_locations)
     parts = _split_path(raw_path)
     if not parts:
         return ClassificationResult(
@@ -268,6 +378,77 @@ def classify_path(path: PathLike) -> ClassificationResult:
             application=application,
         )
     ]
+
+    custom_match = _find_custom_location(raw_path, custom_location_list)
+    if custom_match is not None:
+        conflicting_descendants = _find_conflicting_descendant_locations(
+            raw_path, custom_match, custom_location_list
+        )
+        if conflicting_descendants:
+            nested_paths = ", ".join(location.path for location in conflicting_descendants[:3])
+            involved_applications = {
+                custom_match.application,
+                *(location.application for location in conflicting_descendants),
+            }
+            mixed_application = (
+                custom_match.application
+                if len(involved_applications) == 1
+                else "複数のソフト"
+            )
+            return ClassificationResult(
+                path=raw_path,
+                application=mixed_application,
+                category=DataCategory.MIXED,
+                match_score=100,
+                rule_id="custom_location:mixed_descendants",
+                reason=(
+                    "このフォルダには複数のカスタム分類が含まれています。"
+                    f"配下の別分類登録: {nested_paths}"
+                ),
+                safety_note=_CATEGORY_SAFETY_NOTES[DataCategory.MIXED],
+            )
+
+        # A backup marker nested inside a registered cache folder remains a
+        # backup candidate. Safety-related built-in rules take precedence.
+        backup_rules = [
+            rule for rule in matched_rules
+            if rule.category == DataCategory.BACKUP
+        ]
+        if custom_match.category == "cache" and backup_rules:
+            selected_backup_rule = max(
+                backup_rules, key=lambda rule: (rule.priority, rule.match_score)
+            )
+            return ClassificationResult(
+                path=raw_path,
+                application=custom_match.application,
+                category=DataCategory.BACKUP,
+                match_score=selected_backup_rule.match_score,
+                rule_id=f"backup_override:{selected_backup_rule.rule_id}",
+                reason=(
+                    "登録された保存先内ですが、バックアップを示す名前・拡張子が"
+                    "見つかったため、バックアップ候補として扱いました。"
+                ),
+                safety_note=_CATEGORY_SAFETY_NOTES[DataCategory.BACKUP],
+            )
+
+        custom_category = (
+            DataCategory.CACHE_CANDIDATE
+            if custom_match.category == "cache"
+            else DataCategory.BACKUP
+        )
+        category_label = "キャッシュ" if custom_match.category == "cache" else "バックアップ"
+        return ClassificationResult(
+            path=raw_path,
+            application=custom_match.application,
+            category=custom_category,
+            match_score=100,
+            rule_id=f"custom_location:{custom_match.id}",
+            reason=(
+                f"ユーザーが登録した{category_label}保存先と一致しました。"
+                f"登録パス: {custom_match.path}"
+            ),
+            safety_note=_CATEGORY_SAFETY_NOTES[custom_category],
+        )
 
     if not matched_rules:
         category = DataCategory.UNKNOWN
