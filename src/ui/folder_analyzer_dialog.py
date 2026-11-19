@@ -38,6 +38,7 @@ from core.folder_scanner import (
 class FolderScanWorker(QThread):
     """Execute scan_folder in a worker thread and forward progress by signals."""
 
+    ## 調査中の進捗、完了結果、エラーをGUI側に通知するために用意
     progress_updated = Signal(object)
     scan_completed = Signal(object)
     scan_failed = Signal(str)
