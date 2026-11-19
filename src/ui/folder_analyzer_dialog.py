@@ -25,8 +25,10 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
+from core.dcc_classifier import ClassificationResult, classify_path
 from core.folder_scanner import (
     FolderScanResult,
     ScanProgress,
@@ -38,7 +40,6 @@ from core.folder_scanner import (
 class FolderScanWorker(QThread):
     """Execute scan_folder in a worker thread and forward progress by signals."""
 
-    ## 調査中の進捗、完了結果、エラーをGUI側に通知するために用意
     progress_updated = Signal(object)
     scan_completed = Signal(object)
     scan_failed = Signal(str)
@@ -90,7 +91,8 @@ class FolderAnalyzerDialog(QDialog):
         title = QLabel("フォルダ容量分析")
         title.setObjectName("dialogTitle")
         description = QLabel(
-            "指定したフォルダを読み取り専用で調査し、容量の大きい項目を表示します。"
+            "指定したフォルダを読み取り専用で調査し、容量の大きい項目と"
+            "DCCデータの分類候補を表示します。"
         )
         description.setObjectName("mutedText")
         description.setWordWrap(True)
@@ -146,20 +148,25 @@ class FolderAnalyzerDialog(QDialog):
         root_layout.addWidget(self.summary_label)
 
         self.results_tabs = QTabWidget()
-        self.directory_table = self._create_table(("フォルダ", "容量"))
-        self.file_table = self._create_table(("ファイル", "容量"))
+        self.directory_table = self._create_table(
+            ("フォルダ", "容量", "分類", "対象ソフト")
+        )
+        self.file_table = self._create_table(
+            ("ファイル", "容量", "分類", "対象ソフト")
+        )
         self.results_tabs.addTab(self.directory_table, "直下のフォルダ")
         self.results_tabs.addTab(self.file_table, "大きいファイル TOP 20")
         root_layout.addWidget(self.results_tabs, 1)
 
         footer = QLabel(
-            "この機能は調査のみを行います。ファイルの削除・移動・変更は行いません。"
+            "分類は名前・パスに基づく候補です。削除して安全という意味ではありません。"
+            "この機能はファイルの削除・移動・変更を行いません。"
         )
         footer.setObjectName("footerText")
         footer.setWordWrap(True)
         root_layout.addWidget(footer)
 
-    def _create_table(self, headers: tuple[str, str]) -> QTableWidget:
+    def _create_table(self, headers: tuple[str, ...]) -> QTableWidget:
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(list(headers))
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -167,12 +174,17 @@ class FolderAnalyzerDialog(QDialog):
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
+
+        # The path/name column gets the remaining width. Metadata columns
+        # stay compact so the table remains readable.
         table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch
         )
-        table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents
-        )
+        for column in range(1, len(headers)):
+            table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+
         table.setSortingEnabled(False)
         return table
 
@@ -270,36 +282,70 @@ class FolderAnalyzerDialog(QDialog):
         if result.sample_errors:
             self.summary_label.setToolTip("\n".join(result.sample_errors))
 
+    @staticmethod
+    def _classification_tooltip(result: ClassificationResult) -> str:
+        """Explain the matched rule without implying that deletion is safe."""
+        return (
+            f"判定理由：{result.reason}\n"
+            f"ルール：{result.rule_id}\n"
+            f"一致スコア：{result.match_score}（確率ではありません）\n"
+            f"注意：{result.safety_note}"
+        )
+
     def _populate_directory_table(self, result: FolderScanResult) -> None:
         self.directory_table.setRowCount(len(result.largest_directories))
         for row, entry in enumerate(result.largest_directories):
+            classification = classify_path(entry.path)
+            tooltip = self._classification_tooltip(classification)
+
             name = Path(entry.path).name or entry.path
             name_item = QTableWidgetItem(name)
-            name_item.setToolTip(entry.path)
+            name_item.setToolTip(f"{entry.path}\n\n{tooltip}")
+
             size_item = QTableWidgetItem(format_bytes(entry.size_bytes))
             size_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
+
+            category_item = QTableWidgetItem(classification.category.value)
+            category_item.setToolTip(tooltip)
+            application_item = QTableWidgetItem(classification.application)
+            application_item.setToolTip(tooltip)
+
             self.directory_table.setItem(row, 0, name_item)
             self.directory_table.setItem(row, 1, size_item)
+            self.directory_table.setItem(row, 2, category_item)
+            self.directory_table.setItem(row, 3, application_item)
 
     def _populate_file_table(self, result: FolderScanResult) -> None:
         root = Path(result.root_path)
         self.file_table.setRowCount(len(result.largest_files))
         for row, entry in enumerate(result.largest_files):
+            classification = classify_path(entry.path)
+            tooltip = self._classification_tooltip(classification)
+
             try:
                 display_path = str(Path(entry.path).relative_to(root))
             except ValueError:
                 display_path = entry.path
 
             path_item = QTableWidgetItem(display_path)
-            path_item.setToolTip(entry.path)
+            path_item.setToolTip(f"{entry.path}\n\n{tooltip}")
+
             size_item = QTableWidgetItem(format_bytes(entry.size_bytes))
             size_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
+
+            category_item = QTableWidgetItem(classification.category.value)
+            category_item.setToolTip(tooltip)
+            application_item = QTableWidgetItem(classification.application)
+            application_item.setToolTip(tooltip)
+
             self.file_table.setItem(row, 0, path_item)
             self.file_table.setItem(row, 1, size_item)
+            self.file_table.setItem(row, 2, category_item)
+            self.file_table.setItem(row, 3, application_item)
 
     def _on_scan_failed(self, message: str) -> None:
         self.status_label.setText("調査に失敗しました。フォルダの場所やアクセス権限を確認してください。")
