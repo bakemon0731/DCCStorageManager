@@ -30,8 +30,7 @@ from PySide6.QtWidgets import (
 
 from core.dcc_classifier import ClassificationResult, classify_path
 from core.settings_store import SettingsError, SettingsStore, CustomLocation
-from ui.custom_location_dialog import CustomLocationDialog
-from ui.dcc_discovery_dialog import DccDiscoveryDialog
+from ui.dcc_location_manager_dialog import DccLocationManagerDialog
 from core.folder_scanner import (
     FolderScanResult,
     ScanProgress,
@@ -132,19 +131,15 @@ class FolderAnalyzerDialog(QDialog):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_scan)
 
-        self.custom_locations_button = QPushButton("保存先ルール...")
-        self.custom_locations_button.clicked.connect(self.manage_custom_locations)
-
-        self.discovery_button = QPushButton("DCC保存先を自動検出...")
-        self.discovery_button.clicked.connect(self.discover_dcc_locations)
+        self.location_manager_button = QPushButton("DCC保存先を管理...")
+        self.location_manager_button.clicked.connect(self.manage_dcc_locations)
 
         self.close_button = QPushButton("閉じる")
         self.close_button.clicked.connect(self.close)
 
         action_row.addWidget(self.start_button)
         action_row.addWidget(self.cancel_button)
-        action_row.addWidget(self.custom_locations_button)
-        action_row.addWidget(self.discovery_button)
+        action_row.addWidget(self.location_manager_button)
         action_row.addStretch(1)
         action_row.addWidget(self.close_button)
         root_layout.addLayout(action_row)
@@ -254,8 +249,7 @@ class FolderAnalyzerDialog(QDialog):
         self.start_button.setEnabled(False)
         self.browse_button.setEnabled(False)
         self.folder_path_edit.setEnabled(False)
-        self.custom_locations_button.setEnabled(False)
-        self.discovery_button.setEnabled(False)
+        self.location_manager_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate: total file count is unknown.
         self.status_label.setText("フォルダを調査しています...")
@@ -270,27 +264,12 @@ class FolderAnalyzerDialog(QDialog):
         self._worker = worker
         worker.start()
 
-    def manage_custom_locations(self) -> None:
-        """Open settings UI and refresh the active custom rules after editing."""
+    def manage_dcc_locations(self) -> None:
+        """Open the unified manager and reload active classification rules."""
         if self._worker is not None and self._worker.isRunning():
             return
 
-        dialog = CustomLocationDialog(self._settings_store, self)
-        dialog.exec()
-        try:
-            self._custom_locations = self._settings_store.load().custom_locations
-            self._settings_load_error = None
-            self.status_label.setToolTip("")
-        except SettingsError as exc:
-            self._settings_load_error = str(exc)
-            QMessageBox.warning(self, "設定を読み込めません", str(exc))
-
-    def discover_dcc_locations(self) -> None:
-        """Discover documented DCC save locations and let the user register them."""
-        if self._worker is not None and self._worker.isRunning():
-            return
-
-        dialog = DccDiscoveryDialog(self._settings_store, self)
+        dialog = DccLocationManagerDialog(parent=self)
         dialog.exec()
         try:
             self._custom_locations = self._settings_store.load().custom_locations
@@ -412,8 +391,7 @@ class FolderAnalyzerDialog(QDialog):
         self.start_button.setEnabled(True)
         self.browse_button.setEnabled(True)
         self.folder_path_edit.setEnabled(True)
-        self.custom_locations_button.setEnabled(True)
-        self.discovery_button.setEnabled(True)
+        self.location_manager_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)

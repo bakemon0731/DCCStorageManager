@@ -35,8 +35,7 @@ class DccLocationDiscovery:
 
     This is deliberately conservative:
     - Maya's effective Autosave path is queried inside Maya by a helper script.
-    - ZBrush paths are read from its documented path text files, known folders,
-      and the ZBRUSH_USER_ASSETS_DIR environment variable.
+    - ZBrush paths are read from its documented path text files and known folders.
     - After Effects preference files are located, but their internal keys are
       not parsed because Adobe does not document a stable cache-path key and
       warns against manually editing preference files.
@@ -182,11 +181,11 @@ class DccLocationDiscovery:
                     source="MAYA_AUTOSAVE_FOLDER",
                     explanation=(
                         "環境変数は検出されました。ただしMayaが環境変数方式を選択しているかは"
-                        "別途確認が必要です。環境変数が存在していても、Maya側でEnv Var方式が"
-                        "選択されているとは限りません。Maya内で付属ヘルパーを実行して実際の保存先を照会してください。"
+                        "別途確認が必要です。Maya内で付属ヘルパーを実行すると実際の保存先を照会できます。"
                     ),
-                    # The environment variable alone does not prove Maya is
-                    # configured to use the environment-variable destination.
+                    # The environment variable is only a clue. Maya may not
+                    # currently be using this override, so require a fresh
+                    # query from Maya's own autoSave command before registration.
                     registerable=False,
                     path_exists=exists,
                 )
@@ -266,58 +265,75 @@ class DccLocationDiscovery:
         ]
 
     def _discover_zbrush(self) -> list[DiscoveryCandidate]:
-        """Discover ZBrush paths across current and legacy folder layouts.
-
-        ZBRUSH_USER_ASSETS_DIR overrides the default per-user asset root.
-        A configured QuickSave path file takes precedence over guessing that
-        the adjacent default QuickSave folder is active.
-        """
         candidates: list[DiscoveryCandidate] = []
 
+        # Maxon documents ZBRUSH_USER_ASSETS_DIR as an override for the
+        # user-asset root. Search it first, but do not register the root itself:
+        # only the specific QuickSave/Scratch Disk locations are actionable.
+        configured_assets = self._environment.get("ZBRUSH_USER_ASSETS_DIR", "").strip()
         asset_dirs: list[tuple[Path, str]] = []
-        configured_asset_root = self._environment.get("ZBRUSH_USER_ASSETS_DIR", "").strip()
-        if configured_asset_root:
-            expanded_root = Path(self._expand_path(configured_asset_root))
-            asset_dirs.append((expanded_root, "ZBrush user asset directory from ZBRUSH_USER_ASSETS_DIR"))
-        else:
-            default_root = self._appdata / "Maxon"
-            if default_root.is_dir():
-                for asset_dir in sorted(default_root.glob("ZBrush_*")):
-                    if asset_dir.is_dir():
-                        asset_dirs.append((asset_dir, "ZBrush 2026.1+ default user asset directory"))
-
-        seen_asset_dirs: set[str] = set()
-        for asset_dir, source in asset_dirs:
-            key = os.path.normcase(os.path.normpath(str(asset_dir)))
-            if key in seen_asset_dirs:
-                continue
-            seen_asset_dirs.add(key)
-
-            if not asset_dir.is_dir():
+        if configured_assets:
+            configured_root = Path(self._expand_path(configured_assets))
+            if configured_root.is_dir():
                 candidates.append(
                     DiscoveryCandidate(
                         application="ZBrush",
                         category=None,
-                        path=str(asset_dir),
-                        status="ユーザーアセット保存先にアクセスできません",
-                        source=source,
+                        path=str(configured_root),
+                        status="ユーザーアセットルートを検出",
+                        source="ZBRUSH_USER_ASSETS_DIR",
                         explanation=(
-                            "ZBrushのユーザーアセット保存先として指定されていますが、現在アクセスできません。"
-                            "外付けドライブやネットワークドライブが接続されているか確認してください。"
+                            "Maxonの環境変数で指定されたZBrushユーザーアセットルートです。"
+                            "ルート全体は登録せず、この中のQuickSaveやScratch Diskなど個別の保存先を調査します。"
+                        ),
+                        registerable=False,
+                        path_exists=True,
+                    )
+                )
+                asset_dirs.append((configured_root, "ZBRUSH_USER_ASSETS_DIR"))
+            else:
+                candidates.append(
+                    DiscoveryCandidate(
+                        application="ZBrush",
+                        category=None,
+                        path=str(configured_root),
+                        status="環境変数の保存先にアクセスできません",
+                        source="ZBRUSH_USER_ASSETS_DIR",
+                        explanation=(
+                            "環境変数は設定されていますが、現在そのフォルダにアクセスできません。"
+                            "共有ドライブまたは外付けドライブが接続されているか確認してください。"
                         ),
                         registerable=False,
                         path_exists=False,
                     )
                 )
+
+        # The environment variable is an explicit override. Do not also label
+        # the default AppData location as active in that case; it may be stale.
+        if not configured_assets:
+            user_asset_root = self._appdata / "Maxon"
+            if user_asset_root.is_dir():
+                for asset_dir in sorted(user_asset_root.glob("ZBrush_*")):
+                    if asset_dir.is_dir():
+                        asset_dirs.append((asset_dir, "ZBrush 2026.1+ user asset directory"))
+
+        seen_asset_dirs: set[str] = set()
+        for asset_dir, asset_source in asset_dirs:
+            normalized_asset_dir = os.path.normcase(os.path.abspath(asset_dir))
+            if normalized_asset_dir in seen_asset_dirs:
                 continue
-
-            config_files = self._discover_zbrush_config_files(asset_dir)
-            candidates.extend(config_files)
-            has_quicksave_config = (asset_dir / "ZBrushQuickSavePath.txt").is_file()
-
-            # If a path file exists, its destination is authoritative. Do not
-            # also label an adjacent default QuickSave folder as active.
-            if not has_quicksave_config:
+            seen_asset_dirs.add(normalized_asset_dir)
+            candidates.extend(
+                self._discover_zbrush_config_files(
+                    asset_dir,
+                    source_prefix=asset_source,
+                )
+            )
+            # If ZBrush provides an explicit QuickSave path file, treat it as
+            # authoritative. Do not also guess that the adjacent default folder
+            # is active: it may be a stale folder left behind after relocation.
+            has_quicksave_path_config = (asset_dir / "ZBrushQuickSavePath.txt").is_file()
+            if not has_quicksave_path_config:
                 for folder_name in ("QuickSave", "QuickSaves"):
                     folder = asset_dir / folder_name
                     if folder.is_dir():
@@ -326,25 +342,23 @@ class DccLocationDiscovery:
                                 application="ZBrush",
                                 category="backup",
                                 path=str(folder),
-                                source=source,
+                                source=asset_source,
                                 explanation=(
                                     "ZBrushのユーザーアセットディレクトリ内にあるQuickSaveフォルダです。"
-                                    "QuickSave保存先の個別設定ファイルがないため、既定位置の候補として検出しました。"
                                     "復元用データの可能性があるためバックアップ候補として扱います。"
                                 ),
                             )
                         )
 
-        # ZBrush versions 2026.0.1 and earlier used Public Documents data folders.
         if self._public_documents.is_dir():
             for legacy_dir in sorted(self._public_documents.glob("ZBrushData*")):
                 if not legacy_dir.is_dir():
                     continue
-                config_files = self._discover_zbrush_config_files(legacy_dir)
-                candidates.extend(config_files)
-                has_quicksave_config = (legacy_dir / "ZBrushQuickSavePath.txt").is_file()
-
-                if not has_quicksave_config:
+                candidates.extend(self._discover_zbrush_config_files(legacy_dir))
+                # As with modern user-asset directories, an explicit path file
+                # takes precedence over an inferred adjacent default folder.
+                has_quicksave_path_config = (legacy_dir / "ZBrushQuickSavePath.txt").is_file()
+                if not has_quicksave_path_config:
                     for folder_name in ("QuickSave", "QuickSaves"):
                         folder = legacy_dir / folder_name
                         if folder.is_dir():
@@ -368,12 +382,11 @@ class DccLocationDiscovery:
                     category=None,
                     path=None,
                     status="QuickSave設定を検出できません",
-                    source="ZBrush user asset and legacy data directories",
+                    source="Maxon user asset and legacy data directories",
                     explanation=(
                         "既知のZBrushユーザーアセット／旧データディレクトリに"
                         "QuickSaveや保存先設定ファイルが見つかりませんでした。"
-                        "ZBrushのバージョン、Preferences > Asset Directory、"
-                        "ZBRUSH_USER_ASSETS_DIR環境変数を確認してください。"
+                        "ZBrushのバージョンとPreferences > Asset Directoryを確認してください。"
                     ),
                     registerable=False,
                     path_exists=None,
@@ -381,7 +394,9 @@ class DccLocationDiscovery:
             ]
         return candidates
 
-    def _discover_zbrush_config_files(self, base_dir: Path) -> list[DiscoveryCandidate]:
+    def _discover_zbrush_config_files(
+        self, base_dir: Path, *, source_prefix: str = ""
+    ) -> list[DiscoveryCandidate]:
         candidates: list[DiscoveryCandidate] = []
         config_specs = (
             (
@@ -438,7 +453,7 @@ class DccLocationDiscovery:
                     application="ZBrush",
                     category=category,
                     path=configured_path,
-                    source=source,
+                    source=(f"{source_prefix}: {source}" if source_prefix else source),
                     explanation=f"{description} {base_dir.name}内の設定ファイルから読み取りました。",
                 )
             )

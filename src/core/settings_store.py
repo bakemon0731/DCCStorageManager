@@ -20,6 +20,7 @@ from uuid import uuid4
 SETTINGS_VERSION = 1
 SUPPORTED_APPLICATIONS = ("Maya", "After Effects", "ZBrush")
 SUPPORTED_CATEGORIES = ("cache", "backup")
+SUPPORTED_ORIGINS = ("manual", "discovered")
 
 
 class SettingsError(Exception):
@@ -47,6 +48,8 @@ class CustomLocation:
     application: str
     category: str
     path: str
+    origin: str = "manual"
+    source: str = "手動登録"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +109,8 @@ def _validate_location_data(
     application: str,
     category: str,
     path: str,
+    origin: str = "manual",
+    source: str = "手動登録",
 ) -> CustomLocation:
     if not isinstance(location_id, str) or not location_id.strip():
         raise SettingsFormatError("カスタム保存先のIDが不正です。")
@@ -113,6 +118,12 @@ def _validate_location_data(
         raise SettingsFormatError(f"未対応のアプリケーションです: {application}")
     if category not in SUPPORTED_CATEGORIES:
         raise SettingsFormatError(f"未対応のデータ分類です: {category}")
+    if origin not in SUPPORTED_ORIGINS:
+        raise SettingsFormatError(f"未対応の登録元です: {origin}")
+    if not isinstance(source, str) or not source.strip():
+        source = "手動登録" if origin == "manual" else "自動検出"
+    if len(source) > 200:
+        raise SettingsFormatError("登録元の説明は200文字以内にしてください。")
     if not isinstance(path, str) or not path.strip():
         raise SettingsFormatError("カスタム保存先のパスが空です。")
     try:
@@ -141,6 +152,8 @@ def _validate_location_data(
         application=application,
         category=category,
         path=stored_path,
+        origin=origin,
+        source=source.strip(),
     )
 
 
@@ -186,6 +199,13 @@ class SettingsStore:
                     application=item.get("application"),
                     category=item.get("category"),
                     path=item.get("path"),
+                    # Old STEP 04C settings had no provenance fields.
+                    # Treat them as manual registrations for compatibility.
+                    origin=item.get("origin", "manual"),
+                    source=item.get(
+                        "source",
+                        "手動登録（旧形式）" if item.get("origin") is None else "手動登録",
+                    ),
                 )
                 path_key = normalize_path_for_comparison(location.path)
             except (ValueError, SettingsFormatError) as exc:
@@ -217,6 +237,8 @@ class SettingsStore:
                     "application": location.application,
                     "category": location.category,
                     "path": location.path,
+                    "origin": location.origin,
+                    "source": location.source,
                 }
                 for location in settings.custom_locations
             ],
@@ -244,6 +266,8 @@ class SettingsStore:
         application: str,
         category: str,
         path: str,
+        origin: str = "manual",
+        source: str = "手動登録",
     ) -> CustomLocation:
         """Validate and append one custom location, then save immediately."""
         new_location = _validate_location_data(
@@ -251,6 +275,8 @@ class SettingsStore:
             application=application,
             category=category,
             path=path,
+            origin=origin,
+            source=source,
         )
         settings = self.load()
         new_key = normalize_path_for_comparison(new_location.path)
