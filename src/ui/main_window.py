@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.storage_scanner import DriveInfo, scan_drives
+from ui.folder_analyzer_dialog import FolderAnalyzerDialog
 
 
 class DriveScanWorker(QThread):
@@ -160,12 +161,18 @@ class MainWindow(QMainWindow):
         title_layout.addWidget(title)
         title_layout.addWidget(subtitle)
 
+        self.folder_analyzer_button = QPushButton("フォルダ分析")
+        self.folder_analyzer_button.setObjectName("secondaryButton")
+        self.folder_analyzer_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.folder_analyzer_button.clicked.connect(self.open_folder_analyzer)
+
         self.refresh_button = QPushButton("再スキャン")
         self.refresh_button.setObjectName("refreshButton")
         self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self.start_scan)
 
         header_layout.addLayout(title_layout, 1)
+        header_layout.addWidget(self.folder_analyzer_button, 0, Qt.AlignmentFlag.AlignVCenter)
         header_layout.addWidget(self.refresh_button, 0, Qt.AlignmentFlag.AlignVCenter)
         root_layout.addLayout(header_layout)
 
@@ -211,11 +218,18 @@ class MainWindow(QMainWindow):
             "QLabel#driveName { color: #202938; font-size: 15px; font-weight: 600; }"
             "QLabel#usageLabel { color: #46546A; font-size: 13px; font-weight: 600; }"
             "QLabel#freeSpaceLabel { color: #34445C; font-size: 12px; font-weight: 600; }"
+            "QPushButton#secondaryButton { background: #E7EDF6; color: #315B9B; border: 1px solid #D5DEEA; border-radius: 8px; padding: 10px 18px; font-weight: 600; }"
+            "QPushButton#secondaryButton:hover { background: #DCE6F3; }"
             "QPushButton#refreshButton { background: #315B9B; color: white; border: none; border-radius: 8px; padding: 10px 18px; font-weight: 600; }"
             "QPushButton#refreshButton:hover { background: #274B82; }"
             "QPushButton#refreshButton:disabled { background: #AAB6C8; color: #F5F7FA; }"
             "QScrollArea#driveScrollArea { background: transparent; }"
         )
+
+    def open_folder_analyzer(self) -> None:
+        """Open the folder-size analyzer without mixing it into drive scanning."""
+        dialog = FolderAnalyzerDialog(self)
+        dialog.exec()
 
     def start_scan(self) -> None:
         if self._scan_worker is not None and self._scan_worker.isRunning():
